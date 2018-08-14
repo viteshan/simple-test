@@ -1,10 +1,12 @@
 package datastructures
 
 import (
-	"github.com/Workiva/go-datastructures/queue"
-	"github.com/stretchr/testify/assert"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/Workiva/go-datastructures/queue"
+	"github.com/stretchr/testify/assert"
 )
 
 func TestQueue(t *testing.T) {
@@ -51,4 +53,53 @@ func TestQueue(t *testing.T) {
 	// this to run much slower. For now, just bump up the threshold.
 	assert.InDelta(t, 5, time.Since(before).Seconds()*1000, 10)
 	assert.Equal(t, queue.ErrTimeout, err)
+}
+
+func TestRingBuffer(t *testing.T) {
+	buffer := queue.NewRingBuffer(10)
+	wg := sync.WaitGroup{}
+	wg.Add(1)
+	go func() {
+		_, e := buffer.Get()
+		if e == nil {
+			t.Error("dispose error.")
+		}
+		e.Error()
+		wg.Done()
+	}()
+
+	buffer.Dispose()
+	wg.Wait()
+
+	buffer = queue.NewRingBuffer(10)
+	buffer.Put(1)
+
+	_, e := buffer.Get()
+	if e != nil {
+		t.Error("error for get logic.")
+	}
+	if buffer.Len() != 0 {
+		t.Error("error len for buffer.", buffer.Len())
+	}
+
+	buffer.Put(1)
+	buffer.Put(2)
+	if buffer.Len() != 2 {
+		t.Error("error len for buffer.", buffer.Len())
+	}
+
+	i, e := buffer.Get()
+	if e != nil {
+		t.Error("error for get logic.")
+	}
+	if i.(int) != 1 {
+		t.Error("number should be 1.", i)
+	}
+	i, e = buffer.Get()
+	if e != nil {
+		t.Error("error for get logic.")
+	}
+	if i.(int) != 2 {
+		t.Error("number should be 2.", i)
+	}
 }
