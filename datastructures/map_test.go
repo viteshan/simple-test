@@ -2,6 +2,7 @@ package datastructures
 
 import (
 	"fmt"
+	"strconv"
 	"testing"
 )
 
@@ -43,4 +44,18 @@ func get2(m map[string]*S2) S1 {
 func get3(m map[string]*S2) *S2 {
 	s2 := m["2"]
 	return s2
+}
+
+func TestAppend(t *testing.T) {
+	m := make(map[string][]string)
+
+	for i := 0; i < 10; i++ {
+		s := m[strconv.Itoa(i)]
+		for j := 0; j < 10; j++ {
+			s = append(s, strconv.Itoa(j))
+		}
+		m[strconv.Itoa(i)] = s
+	}
+
+	fmt.Printf("%v", m)
 }
