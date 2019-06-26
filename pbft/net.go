@@ -71,23 +71,26 @@ func (n *net) exist(id uint32) bool {
 func (n *net) newChannel(toId uint32) chan *msgWrapper {
 	ch := make(chan *msgWrapper, 100)
 	go func() {
-		select {
-		case msg := <-ch:
-			if n.exist(msg.to) {
-				diff := time.Now().Sub(msg.msgTime)
-				delay := n.randomDelay()
-				if delay > diff {
-					time.Sleep(delay - diff)
+		for {
+			select {
+			case msg := <-ch:
+				if n.exist(msg.to) {
+					diff := time.Now().Sub(msg.msgTime)
+					delay := n.randomDelay()
+					if delay > diff {
+						time.Sleep(delay - diff)
+					}
+					select {
+					case n.nodes[msg.to] <- msg.msg:
+					default:
+						log15.Error(fmt.Sprintf("node channel[%d] full, loss msg:%v", msg.to, msg.msg))
+					}
 				}
-				select {
-				case n.nodes[msg.to] <- msg.msg:
-				default:
-					log15.Error(fmt.Sprintf("node channel[%d] full, loss msg:%v", msg.to, msg.msg))
+			case <-time.After(5 * time.Second):
+				if !n.exist(toId) {
+					fmt.Println("send channel exit", toId)
+					return
 				}
-			}
-		case <-time.After(5 * time.Second):
-			if !n.exist(toId) {
-				return
 			}
 		}
 	}()
