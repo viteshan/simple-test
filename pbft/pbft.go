@@ -104,6 +104,8 @@ type Node struct {
 	peers   map[uint32]*Node
 	clients map[uint32]*Cli
 
+	net		Net
+
 	cur *CurState
 }
 
@@ -246,15 +248,25 @@ func (n *Node) switchToCommit(msg *PPMsg) error {
 
 func (n *Node) broadcast(msg interface{}) error {
 	for _, v := range n.peers {
-		ch, _ := v.GetCh()
-		ch <- msg
+		err := n.net.SendTo(n.idx, v.idx, msg)
+		if err != nil {
+			log15.Error(fmt.Sprintf("Send msg error %s - %d", err.Error() ,n.idx))
+			continue
+		}
+		//ch, _ := v.GetCh()
+		//ch <- msg
 	}
 	return nil
 }
 func (n *Node) broadcastToClients(msg interface{}) error {
 	for _, v := range n.clients {
-		ch, _ := v.GetCh()
-		ch <- msg
+		err := n.net.SendTo(n.idx, v.idx, msg)
+		if err != nil {
+			log15.Error(fmt.Sprintf("Send msg error %s - %d", err.Error() ,n.idx))
+			continue
+		}
+		//ch, _ := v.GetCh()
+		//ch <- msg
 	}
 	return nil
 }
@@ -361,6 +373,8 @@ type Cli struct {
 	ch          chan interface{}
 	peers       map[uint32]*Node
 
+	net 		Net
+
 	waitingReply *waitingStateImpl
 }
 
@@ -401,8 +415,12 @@ func (c *Cli) SendRequest(op string) error {
 	primary := c.calcPrimary()
 	node := c.peers[primary]
 
-	ch, _ := node.GetCh()
-	ch <- msg
+	errMsg := c.net.SendTo(c.idx, node.idx, msg)
+	if errMsg != nil {
+		return errMsg
+	}
+	//ch, _ := node.GetCh()
+	//ch <- msg
 	err := <-waitingCh
 	c.waitingReply = nil
 	return err

@@ -4,6 +4,8 @@ import "testing"
 
 func TestPbft(t *testing.T) {
 
+	nn := newNet()
+
 	clusterSize := int32(4)
 	f := int(1)
 	var nodes []*Node
@@ -22,6 +24,13 @@ func TestPbft(t *testing.T) {
 			peers:   make(map[uint32]*Node),
 			clients: make(map[uint32]*Cli),
 			cur:     &CurState{},
+			net:          nn,
+		}
+
+		err := nn.Register(n.idx, n.ch)
+		if err != nil {
+			t.Error("Register error ", err)
+			t.FailNow()
 		}
 
 		nodes = append(nodes, n)
@@ -34,6 +43,12 @@ func TestPbft(t *testing.T) {
 		ch:           make(chan interface{}),
 		peers:        make(map[uint32]*Node),
 		waitingReply: nil,
+		net:          nn,
+	}
+	errC := nn.Register(c.idx, c.ch)
+	if errC != nil {
+		t.Error("Register error ", errC)
+		t.FailNow()
 	}
 
 	for _, n := range nodes {
