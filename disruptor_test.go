@@ -2,10 +2,11 @@ package main
 
 import (
 	"fmt"
-	"github.com/smartystreets/go-disruptor"
-	"testing"
 	"runtime"
+	"testing"
 	"time"
+
+	"github.com/smartystreets/go-disruptor"
 )
 
 const (
@@ -17,14 +18,12 @@ const (
 
 var ring = [BufferSize]int64{}
 
-
-
 func TestDisruptor(t *testing.T) {
 	runtime.GOMAXPROCS(2)
 
 	controller := disruptor.
 		Configure(BufferSize).
-		WithConsumerGroup(SampleConsumer{}).
+		WithConsumerGroup(&SampleConsumer{}, &SampleConsumer{}).
 		Build()
 
 	controller.Start()
@@ -37,11 +36,10 @@ func TestDisruptor(t *testing.T) {
 	fmt.Println(Iterations, finished.Sub(started))
 }
 
-func TestDisruptorEvent(t *testing.T){
+func TestDisruptorEvent(t *testing.T) {
 	disruptor.Configure(BufferSize)
 
 }
-
 
 func publish(writer *disruptor.Writer) {
 	sequence := disruptor.InitialSequenceValue

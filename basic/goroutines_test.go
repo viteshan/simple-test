@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"testing"
 	"time"
+
+	"github.com/pkg/profile"
 )
 
 func TestRoutines(t *testing.T) {
@@ -38,6 +40,8 @@ func TestRoutines(t *testing.T) {
 }
 
 func TestFor(t *testing.T) {
+	defer profile.Start().Stop()
+
 	t1 := time.Now() // get current time
 	for i := 0; i < 10; i++ {
 		//logic handlers

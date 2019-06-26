@@ -2,8 +2,9 @@ package main
 
 import (
 	"fmt"
-	"github.com/asaskevich/EventBus"
 	"testing"
+
+	"github.com/asaskevich/EventBus"
 )
 
 func calculator1(a int, b int) {

@@ -13,18 +13,18 @@ import (
 
 func TestTcpConn(t *testing.T) {
 	go func() {
-		error := tcpConn("127.0.0.1", 9001, 9002)
+		error := tcpConn("150.109.101.200", 8888, 9005)
 		if error != nil {
 			t.Error(error)
 		}
 	}()
 
-	go func() {
-		error := tcpConn("127.0.0.1", 9002, 9001)
-		if error != nil {
-			t.Error(error)
-		}
-	}()
+	//go func() {
+	//	error := tcpConn("127.0.0.1", 9002, 9001)
+	//	if error != nil {
+	//		t.Error(error)
+	//	}
+	//}()
 
 	c := make(chan int)
 	c <- 1
@@ -61,18 +61,18 @@ func tcpConn(peerPubAddr string, peerPubPort int, localPort int) error {
 }
 func TestUdpConn(t *testing.T) {
 	go func() {
-		error := udpConn("127.0.0.1", 9001, 9002)
+		error := udpConn("111.204.124.34", 9000, 9001)
 		if error != nil {
 			t.Error(error)
 		}
 	}()
 
-	go func() {
-		error := udpConn("127.0.0.1", 9002, 9001)
-		if error != nil {
-			t.Error(error)
-		}
-	}()
+	//go func() {
+	//	error := udpConn("127.0.0.1", 9002, 9001)
+	//	if error != nil {
+	//		t.Error(error)
+	//	}
+	//}()
 
 	c := make(chan int)
 	c <- 1

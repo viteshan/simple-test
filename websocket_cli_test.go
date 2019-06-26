@@ -1,28 +1,24 @@
 package main
 
 import (
-	"flag"
 	"log"
+	"net/http"
 	"net/url"
-	"os"
-	"os/signal"
+	"strconv"
 	"time"
 
-	"github.com/gorilla/websocket"
 	"testing"
+
+	"github.com/gorilla/websocket"
 )
 
-func TestCli(t *testing.T) {
-	flag.Parse()
-	log.SetFlags(0)
+func TestCli2(t *testing.T) {
 
-	interrupt := make(chan os.Signal, 1)
-	signal.Notify(interrupt, os.Interrupt)
-
-	u := url.URL{Scheme: "ws", Host: *addr, Path: "/ws"}
+	u := url.URL{Scheme: "ws", Host: "192.168.31.146:8080", Path: "/dev/websocket/viteshan"}
 	log.Printf("connecting to %s", u.String())
 
-	c, _, err := websocket.DefaultDialer.Dial(u.String(), nil)
+	c, _, err := websocket.DefaultDialer.Dial(u.String(), http.Header{"x-forwarded-for": {"192.168.31.47"}})
+	//c, _, err := websocket.DefaultDialer.Dial(u.String(), nil)
 	if err != nil {
 		log.Fatal("dial:", err)
 	}
@@ -30,21 +26,39 @@ func TestCli(t *testing.T) {
 	defer c.Close()
 
 	done := make(chan struct{})
-	c.WriteJSON(&Req{Id: 10, Addr: "----"})
 
 	go func() {
 		defer close(done)
 		for {
-			_, message, err := c.ReadMessage()
-			if err != nil {
-				log.Println("read:", err)
+			select {
+			case <-done:
 				return
+			default:
+				_, message, err := c.ReadMessage()
+				if err != nil {
+					log.Println("read:", err)
+					return
+				}
+				log.Printf("recv: %s", message)
 			}
-			log.Printf("recv: %s", message)
+		}
+	}()
+	go func() {
+		defer close(done)
+		i := 0
+		for {
+			i++
+			select {
+			case <-done:
+				return
+			default:
+				c.WriteMessage(websocket.TextMessage, []byte("hello"+strconv.Itoa(i)))
+			}
+			time.Sleep(time.Second * 1)
 		}
 	}()
 
-	ticker := time.NewTicker(8 * time.Second)
+	ticker := time.NewTicker(1000 * time.Second)
 	defer ticker.Stop()
 
 	for {
@@ -52,32 +66,7 @@ func TestCli(t *testing.T) {
 		case <-done:
 			return
 		case <-ticker.C:
-			err := c.WriteJSON(&Req{Tp: 1})
-			if err != nil {
-				log.Println("write:", err)
-				return
-			}
-		case <-interrupt:
-			log.Println("interrupt")
-
-			// Cleanly close the connection by sending a close message and then
-			// waiting (with timeout) for the server to close the connection.
-			err := c.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
-			if err != nil {
-				log.Println("write close:", err)
-				return
-			}
-			select {
-			case <-done:
-			case <-time.After(time.Second):
-			}
-			return
+			close(done)
 		}
 	}
-}
-
-type Req struct {
-	Tp   int
-	Id   int
-	Addr string
 }
