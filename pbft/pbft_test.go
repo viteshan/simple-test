@@ -85,6 +85,7 @@ func TestPbft(t *testing.T) {
 	for _, n := range nodes {
 		go n.loopRead()
 		go n.loopBuf()
+		go n.loopHeartBeat()
 	}
 
 	nodes[1].down = true

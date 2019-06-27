@@ -47,6 +47,10 @@ func (m nodeMsg) getFromIdx() uint32 {
 	return m.fromIdx
 }
 
+type HeartBeatMsg struct {
+	nodeMsg
+}
+
 // just from master
 type PPMsg struct {
 	nodeMsg
@@ -179,6 +183,21 @@ func (n *Node) GetCh() (chan<- interface{}, error) {
 	return n.ch, nil
 }
 
+func (n *Node) loopHeartBeat() error {
+	for {
+		time.Sleep(2 * time.Second)
+		s := *n.state
+		msg := HeartBeatMsg{
+			nodeMsg: nodeMsg{
+				viewId:  s.viewId,
+				seq:     s.seq,
+				fromIdx: n.idx,
+			},
+		}
+		n.broadcast(msg)
+	}
+}
+
 func (n *Node) loopRead() error {
 	for v := range n.ch {
 		if n.down {
@@ -248,11 +267,22 @@ func (n *Node) waitingCommit() (err error) {
 
 func (n *Node) onReceive(msg interface{}) (err error) {
 	if nnMsg, ok := msg.(NodeMsg); ok {
-		if nnMsg.getSeq() > n.state.seq+1 && n.cur.cur == 0 {
-			key := fmt.Sprintf("seq:%d", nnMsg.getSeq())
-			n.syncCounter.Done(key, nnMsg.getFromIdx())
-			if n.syncCounter.Ok(key) {
-				n.switchToSync()
+
+		if _, ok := msg.(*HeartBeatMsg); ok {
+			if nnMsg.getSeq() > n.state.seq && n.cur.cur == 0 {
+				key := fmt.Sprintf("seq:%d", nnMsg.getSeq())
+				n.syncCounter.Done(key, nnMsg.getFromIdx())
+				if n.syncCounter.Ok(key) {
+					n.switchToSync()
+				}
+			}
+		} else {
+			if nnMsg.getSeq() > n.state.seq+1 && n.cur.cur == 0 {
+				key := fmt.Sprintf("seq:%d", nnMsg.getSeq())
+				n.syncCounter.Done(key, nnMsg.getFromIdx())
+				if n.syncCounter.Ok(key) {
+					n.switchToSync()
+				}
 			}
 		}
 	}
@@ -284,6 +314,7 @@ func (n *Node) onReceive(msg interface{}) (err error) {
 			fmt.Printf("[%d]receive sync response msg:%s\n", n.idx, msg)
 			n.mBuf.syncBuf.Enqueue(m)
 		}
+	case *HeartBeatMsg:
 	}
 	return
 }
@@ -408,7 +439,7 @@ func (n *Node) switchToSync() error {
 
 	go func(closed chan struct{}) {
 		select {
-		case <-time.After(10 * time.Second):
+		case <-time.After(3 * time.Second):
 			n.syncTimeout()
 		case <-closed:
 		}
