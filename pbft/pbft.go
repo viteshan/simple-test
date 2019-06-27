@@ -109,7 +109,7 @@ func calculateHash(bs []byte) string {
 type CurState struct {
 	cur          int32
 	ppMsg        *PPMsg
-	waitingState *waitingStateImpl
+	waitingState *stateCounterImpl
 }
 
 func (cur *CurState) reset() {
@@ -121,13 +121,13 @@ func (cur *CurState) switchCur(from int32, to int32) bool {
 	return atomic.CompareAndSwapInt32(&cur.cur, from, to)
 }
 
-type waitingStateImpl struct {
+type stateCounterImpl struct {
 	okCnt     int
 	done      map[string]map[uint32]struct{}
 	timeoutCh chan struct{}
 }
 
-func (s *waitingStateImpl) Done(key string, idx uint32) error {
+func (s *stateCounterImpl) Done(key string, idx uint32) error {
 	cnt, ok := s.done[key]
 	if !ok {
 		cnt = make(map[uint32]struct{})
@@ -137,17 +137,17 @@ func (s *waitingStateImpl) Done(key string, idx uint32) error {
 	return nil
 }
 
-func (s *waitingStateImpl) Destroy() error {
+func (s *stateCounterImpl) Destroy() error {
 	close(s.timeoutCh)
 	return nil
 }
 
-func (s waitingStateImpl) Ok(key string) bool {
+func (s stateCounterImpl) Ok(key string) bool {
 	cnt := s.done[key]
 	return len(cnt) >= s.okCnt
 }
 
-type WaitingState interface {
+type StateCounter interface {
 	Ok(key string) bool
 	Done(key string, idx uint32) error
 	Destroy() error
@@ -171,6 +171,8 @@ type Node struct {
 	down bool
 
 	cur *CurState
+
+	syncCounter *stateCounterImpl
 }
 
 func (n *Node) GetCh() (chan<- interface{}, error) {
@@ -247,8 +249,11 @@ func (n *Node) waitingCommit() (err error) {
 func (n *Node) onReceive(msg interface{}) (err error) {
 	if nnMsg, ok := msg.(NodeMsg); ok {
 		if nnMsg.getSeq() > n.state.seq+1 && n.cur.cur == 0 {
-			// trigger sync
-			n.switchToSync()
+			key := fmt.Sprintf("seq:%d", nnMsg.getSeq())
+			n.syncCounter.Done(key, nnMsg.getFromIdx())
+			if n.syncCounter.Ok(key) {
+				n.switchToSync()
+			}
 		}
 	}
 
@@ -340,7 +345,7 @@ func (n *Node) switchToPrepare(msg *PPMsg) error {
 		return errors.Errorf("switch fail.")
 	}
 
-	n.cur.waitingState = &waitingStateImpl{
+	n.cur.waitingState = &stateCounterImpl{
 		okCnt: 2*n.f + 1,
 
 		done:      make(map[string]map[uint32]struct{}),
@@ -395,7 +400,7 @@ func (n *Node) switchToSync() error {
 		return errors.Errorf("switch fail.")
 	}
 
-	n.cur.waitingState = &waitingStateImpl{
+	n.cur.waitingState = &stateCounterImpl{
 		okCnt:     2*n.f + 1,
 		done:      make(map[string]map[uint32]struct{}),
 		timeoutCh: make(chan struct{}),
@@ -432,7 +437,7 @@ func (n *Node) switchToCommit(msg *PPMsg) error {
 	old := n.cur.waitingState
 	old.Destroy()
 
-	n.cur.waitingState = &waitingStateImpl{
+	n.cur.waitingState = &stateCounterImpl{
 		okCnt:     2*n.f + 1,
 		done:      make(map[string]map[uint32]struct{}),
 		timeoutCh: make(chan struct{}),
@@ -636,7 +641,7 @@ type Cli struct {
 
 	net Net
 
-	waitingReply *waitingStateImpl
+	waitingReply *stateCounterImpl
 	cur          *ReqMsg
 }
 
@@ -657,7 +662,7 @@ func (c *Cli) SendRequest(op string) error {
 	}
 	c.cur = msg
 
-	c.waitingReply = &waitingStateImpl{
+	c.waitingReply = &stateCounterImpl{
 		okCnt:     c.f + 1,
 		done:      make(map[string]map[uint32]struct{}),
 		timeoutCh: make(chan struct{}),

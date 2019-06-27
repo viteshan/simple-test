@@ -40,6 +40,11 @@ func TestPbft(t *testing.T) {
 				commitBuf:  queue.New(),
 				replyBuf:   queue.New(),
 			},
+			syncCounter: &stateCounterImpl{
+				okCnt:     2*f + 1,
+				done:      make(map[string]map[uint32]struct{}),
+				timeoutCh: nil,
+			},
 		}
 
 		err := nn.Register(n.idx, n.ch)
@@ -106,6 +111,7 @@ func TestPbft(t *testing.T) {
 	s := int64(-1)
 
 	for i := 0; i < 10; i++ {
+		ok = true
 		for _, v := range nodes {
 			if s < 0 {
 				s = v.state.seq
@@ -118,7 +124,6 @@ func TestPbft(t *testing.T) {
 		if ok {
 			break
 		}
-		ok = true
 		time.Sleep(time.Second)
 	}
 
