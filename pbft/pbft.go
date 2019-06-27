@@ -6,6 +6,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/golang-collections/collections/queue"
+
 	"github.com/vitelabs/go-vite/log15"
 	"github.com/viteshan/go/support/errors"
 )
@@ -108,6 +110,8 @@ type Node struct {
 
 	mBuf *msgBuffer
 
+	down bool
+
 	cur *CurState
 }
 
@@ -117,6 +121,9 @@ func (n *Node) GetCh() (chan<- interface{}, error) {
 
 func (n *Node) loopRead() error {
 	for v := range n.ch {
+		if n.down {
+			continue
+		}
 		err := n.onReceive(v)
 		if err != nil {
 			log15.Error(err.Error())
@@ -146,49 +153,33 @@ func (n *Node) loopBuf() error {
 }
 
 func (n *Node) waitingRequestForPrimary() (err error) {
-	for len(n.mBuf.reqBuf) > 0 {
-		select {
-		case m := <-n.mBuf.reqBuf:
-			n.onRequestMsg(m)
-		default:
-			continue
-		}
+	for n.mBuf.reqBuf.Len() > 0 {
+		m := n.mBuf.reqBuf.Dequeue().(*ReqMsg)
+		n.onRequestMsg(m)
 	}
 	return nil
 }
 
 func (n *Node) waitingRequest() (err error) {
-	for len(n.mBuf.ppBuf) > 0 {
-		select {
-		case m := <-n.mBuf.ppBuf:
-			n.onPrePrepareMsg(m)
-		default:
-			continue
-		}
+	for n.mBuf.ppBuf.Len() > 0 {
+		m := n.mBuf.ppBuf.Dequeue().(*PPMsg)
+		n.onPrePrepareMsg(m)
 	}
 	return nil
 }
 
 func (n *Node) waitingPrepare() (err error) {
-	for len(n.mBuf.prepareBuf) > 0 {
-		select {
-		case m := <-n.mBuf.prepareBuf:
-			n.onPrepareMsg(m)
-		default:
-			continue
-		}
+	for n.mBuf.prepareBuf.Len() > 0 {
+		m := n.mBuf.prepareBuf.Dequeue().(*BFTMsg)
+		n.onPrepareMsg(m)
 	}
 	return nil
 }
 
 func (n *Node) waitingCommit() (err error) {
-	for len(n.mBuf.commitBuf) > 0 {
-		select {
-		case m := <-n.mBuf.commitBuf:
-			n.onCommitMsg(m)
-		default:
-			continue
-		}
+	for n.mBuf.commitBuf.Len() > 0 {
+		m := n.mBuf.commitBuf.Dequeue().(*BFTMsg)
+		n.onCommitMsg(m)
 	}
 	return nil
 }
@@ -198,33 +189,21 @@ func (n *Node) onReceive(msg interface{}) (err error) {
 	switch m := msg.(type) {
 	case *ReqMsg:
 		fmt.Printf("[%d]receive request msg:%s\n", n.idx, msg)
-		select {
-		case n.mBuf.reqBuf <- m:
-		default:
-			fmt.Printf("[%d]request msg loss, %v", n.idx, m)
-		}
+		n.mBuf.reqBuf.Enqueue(m)
+		//fmt.Printf("[%d]request msg loss, %v", n.idx, m)
 	case *PPMsg:
 		fmt.Printf("[%d]receive pp msg:%s\n", n.idx, msg)
-		select {
-		case n.mBuf.ppBuf <- m:
-		default:
-			fmt.Printf("[%d]pp msg loss, %v", n.idx, m)
-		}
+		n.mBuf.ppBuf.Enqueue(m)
+		//fmt.Printf("[%d]pp msg loss, %v", n.idx, m)
 	case *BFTMsg:
 		if m.tp == 0 {
 			fmt.Printf("[%d]receive prepare msg:%s\n", n.idx, msg)
-			select {
-			case n.mBuf.prepareBuf <- m:
-			default:
-				fmt.Printf("[%d]prepare msg loss, %v", n.idx, m)
-			}
+			n.mBuf.prepareBuf.Enqueue(m)
+			//fmt.Printf("[%d]prepare msg loss, %v", n.idx, m)
 		} else {
 			fmt.Printf("[%d]receive commit msg:%s\n", n.idx, msg)
-			select {
-			case n.mBuf.commitBuf <- m:
-			default:
-				fmt.Printf("[%d]commit msg loss, %v", n.idx, m)
-			}
+			n.mBuf.commitBuf.Enqueue(m)
+			//fmt.Printf("[%d]commit msg loss, %v", n.idx, m)
 		}
 	}
 	return
@@ -366,6 +345,9 @@ func (n *Node) onPrePrepareMsg(m *PPMsg) error {
 	if n.isPrimary() {
 		return nil
 	}
+	if n.state.seq+1 != m.seq {
+		return nil
+	}
 	if n.cur.cur != 0 {
 		return nil
 	}
@@ -378,6 +360,7 @@ func (n *Node) onPrePrepareMsg(m *PPMsg) error {
 		log15.Error(err.Error())
 		return nil
 	}
+	n.cur.waitingState.Done(m.fromIdx)
 	msg := &BFTMsg{
 		tp:        0,
 		viewId:    m.viewId,
@@ -556,14 +539,16 @@ func (c *Cli) onReplyMsg(m *ReplyMsg) error {
 			impl.Destroy()
 		}
 	}
+	q := queue.New()
+	q.Peek()
 	return nil
 }
 
 type msgBuffer struct {
 	// viewId + hash
-	reqBuf     chan *ReqMsg
-	ppBuf      chan *PPMsg
-	prepareBuf chan *BFTMsg
-	commitBuf  chan *BFTMsg
-	replyBuf   chan *ReplyMsg
+	reqBuf     *queue.Queue
+	ppBuf      *queue.Queue
+	prepareBuf *queue.Queue
+	commitBuf  *queue.Queue
+	replyBuf   *queue.Queue
 }

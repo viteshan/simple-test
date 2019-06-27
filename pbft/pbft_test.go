@@ -1,6 +1,10 @@
 package pbft
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/golang-collections/collections/queue"
+)
 
 func TestPbft(t *testing.T) {
 
@@ -26,11 +30,11 @@ func TestPbft(t *testing.T) {
 			cur:     &CurState{},
 			net:     nn,
 			mBuf: &msgBuffer{
-				reqBuf:     make(chan *ReqMsg, 100),
-				ppBuf:      make(chan *PPMsg, 100),
-				prepareBuf: make(chan *BFTMsg, 100),
-				commitBuf:  make(chan *BFTMsg, 100),
-				replyBuf:   make(chan *ReplyMsg, 100),
+				reqBuf:     queue.New(),
+				ppBuf:      queue.New(),
+				prepareBuf: queue.New(),
+				commitBuf:  queue.New(),
+				replyBuf:   queue.New(),
 			},
 		}
 
@@ -74,6 +78,7 @@ func TestPbft(t *testing.T) {
 		go n.loopBuf()
 	}
 
+	nodes[1].down = true
 	err := c.SendRequest("hello")
 
 	if err != nil {
