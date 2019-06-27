@@ -104,7 +104,9 @@ type Node struct {
 	peers   map[uint32]*Node
 	clients map[uint32]*Cli
 
-	net		Net
+	net Net
+
+	mBuf *msgBuffer
 
 	cur *CurState
 }
@@ -124,27 +126,111 @@ func (n *Node) loopRead() error {
 	return nil
 }
 
+func (n *Node) loopBuf() error {
+	for {
+		if n.cur.cur == 0 {
+			if n.isPrimary() {
+				n.waitingRequestForPrimary()
+			} else {
+				n.waitingRequest()
+			}
+		} else if n.cur.cur == 1 {
+			n.waitingPrepare()
+		} else if n.cur.cur == 2 {
+			n.waitingCommit()
+		} else {
+			panic("unknown status")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func (n *Node) waitingRequestForPrimary() (err error) {
+	for len(n.mBuf.reqBuf) > 0 {
+		select {
+		case m := <-n.mBuf.reqBuf:
+			n.onRequestMsg(m)
+		default:
+			continue
+		}
+	}
+	return nil
+}
+
+func (n *Node) waitingRequest() (err error) {
+	for len(n.mBuf.ppBuf) > 0 {
+		select {
+		case m := <-n.mBuf.ppBuf:
+			n.onPrePrepareMsg(m)
+		default:
+			continue
+		}
+	}
+	return nil
+}
+
+func (n *Node) waitingPrepare() (err error) {
+	for len(n.mBuf.prepareBuf) > 0 {
+		select {
+		case m := <-n.mBuf.prepareBuf:
+			n.onPrepareMsg(m)
+		default:
+			continue
+		}
+	}
+	return nil
+}
+
+func (n *Node) waitingCommit() (err error) {
+	for len(n.mBuf.commitBuf) > 0 {
+		select {
+		case m := <-n.mBuf.commitBuf:
+			n.onCommitMsg(m)
+		default:
+			continue
+		}
+	}
+	return nil
+}
+
 func (n *Node) onReceive(msg interface{}) (err error) {
 
 	switch m := msg.(type) {
 	case *ReqMsg:
 		fmt.Printf("[%d]receive request msg:%s\n", n.idx, msg)
-		err = n.onRequestMsg(m)
+		select {
+		case n.mBuf.reqBuf <- m:
+		default:
+			fmt.Printf("[%d]request msg loss, %v", n.idx, m)
+		}
 	case *PPMsg:
 		fmt.Printf("[%d]receive pp msg:%s\n", n.idx, msg)
-		err = n.onPrePrepareMsg(m)
+		select {
+		case n.mBuf.ppBuf <- m:
+		default:
+			fmt.Printf("[%d]pp msg loss, %v", n.idx, m)
+		}
 	case *BFTMsg:
 		if m.tp == 0 {
 			fmt.Printf("[%d]receive prepare msg:%s\n", n.idx, msg)
-			err = n.onPrepareMsg(m)
+			select {
+			case n.mBuf.prepareBuf <- m:
+			default:
+				fmt.Printf("[%d]prepare msg loss, %v", n.idx, m)
+			}
 		} else {
 			fmt.Printf("[%d]receive commit msg:%s\n", n.idx, msg)
-			err = n.onCommitMsg(m)
+			select {
+			case n.mBuf.commitBuf <- m:
+			default:
+				fmt.Printf("[%d]commit msg loss, %v", n.idx, m)
+			}
 		}
 	}
 	return
 }
 func (n *Node) onRequestMsg(m *ReqMsg) error {
+	fmt.Printf("[%d]on request msg:%v\n", n.idx, m)
 	if !n.isPrimary() {
 		return nil
 	}
@@ -250,7 +336,7 @@ func (n *Node) broadcast(msg interface{}) error {
 	for _, v := range n.peers {
 		err := n.net.SendTo(n.idx, v.idx, msg)
 		if err != nil {
-			log15.Error(fmt.Sprintf("Send msg error %s - %d", err.Error() ,n.idx))
+			log15.Error(fmt.Sprintf("Send msg error %s - %d", err.Error(), n.idx))
 			continue
 		}
 		//ch, _ := v.GetCh()
@@ -262,7 +348,7 @@ func (n *Node) broadcastToClients(msg interface{}) error {
 	for _, v := range n.clients {
 		err := n.net.SendTo(n.idx, v.idx, msg)
 		if err != nil {
-			log15.Error(fmt.Sprintf("Send msg error %s - %d", err.Error() ,n.idx))
+			log15.Error(fmt.Sprintf("Send msg error %s - %d", err.Error(), n.idx))
 			continue
 		}
 		//ch, _ := v.GetCh()
@@ -276,6 +362,7 @@ func (n *Node) isPrimary() bool {
 }
 
 func (n *Node) onPrePrepareMsg(m *PPMsg) error {
+	fmt.Printf("[%d]on pp msg:%v\n", n.idx, m)
 	if n.isPrimary() {
 		return nil
 	}
@@ -304,7 +391,9 @@ func (n *Node) onPrePrepareMsg(m *PPMsg) error {
 }
 
 func (n *Node) onPrepareMsg(m *BFTMsg) error {
+	fmt.Printf("[%d]on prepare msg:%v\n", n.idx, m)
 	if n.cur.cur != 1 {
+		// put to buffer
 		return nil
 	}
 
@@ -336,6 +425,7 @@ func (n *Node) onPrepareMsg(m *BFTMsg) error {
 }
 
 func (n *Node) onCommitMsg(m *BFTMsg) error {
+	fmt.Printf("[%d]on commit msg:%v\n", n.idx, m)
 	if n.cur.cur != 2 {
 		return nil
 	}
@@ -373,7 +463,7 @@ type Cli struct {
 	ch          chan interface{}
 	peers       map[uint32]*Node
 
-	net 		Net
+	net Net
 
 	waitingReply *waitingStateImpl
 }
@@ -467,4 +557,13 @@ func (c *Cli) onReplyMsg(m *ReplyMsg) error {
 		}
 	}
 	return nil
+}
+
+type msgBuffer struct {
+	// viewId + hash
+	reqBuf     chan *ReqMsg
+	ppBuf      chan *PPMsg
+	prepareBuf chan *BFTMsg
+	commitBuf  chan *BFTMsg
+	replyBuf   chan *ReplyMsg
 }

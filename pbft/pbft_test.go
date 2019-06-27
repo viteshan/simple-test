@@ -24,7 +24,14 @@ func TestPbft(t *testing.T) {
 			peers:   make(map[uint32]*Node),
 			clients: make(map[uint32]*Cli),
 			cur:     &CurState{},
-			net:          nn,
+			net:     nn,
+			mBuf: &msgBuffer{
+				reqBuf:     make(chan *ReqMsg, 100),
+				ppBuf:      make(chan *PPMsg, 100),
+				prepareBuf: make(chan *BFTMsg, 100),
+				commitBuf:  make(chan *BFTMsg, 100),
+				replyBuf:   make(chan *ReplyMsg, 100),
+			},
 		}
 
 		err := nn.Register(n.idx, n.ch)
@@ -64,6 +71,7 @@ func TestPbft(t *testing.T) {
 	go c.loopRead()
 	for _, n := range nodes {
 		go n.loopRead()
+		go n.loopBuf()
 	}
 
 	err := c.SendRequest("hello")
