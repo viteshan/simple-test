@@ -1,7 +1,8 @@
 package pbft
 
 import (
-	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"sync/atomic"
 	"time"
@@ -17,25 +18,48 @@ type ReqMsg struct {
 	operation string
 	timestamp int64
 	owner     uint32
+	hash      string
+}
+
+// node to node
+type NodeMsg interface {
+	getViewId() int64
+	getSeq() int64
+	getFromIdx() uint32
+}
+
+type nodeMsg struct {
+	NodeMsg
+	viewId  int64
+	seq     int64
+	fromIdx uint32
+}
+
+func (m nodeMsg) getViewId() int64 {
+	return m.viewId
+}
+
+func (m nodeMsg) getSeq() int64 {
+	return m.seq
+}
+
+func (m nodeMsg) getFromIdx() uint32 {
+	return m.fromIdx
 }
 
 // just from master
 type PPMsg struct {
+	nodeMsg
 	requests  *ReqMsg
-	viewId    int64
-	seq       int64
-	hash      []byte // requests
-	fromIdx   uint32
+	hash      string // requests
 	signature []byte
 }
 
 // 2f + 1
 type BFTMsg struct {
+	nodeMsg
 	tp        int // tp:0  prepare-message   tp:1  commit-message
-	viewId    int64
-	seq       int64
-	hash      []byte
-	fromIdx   uint32
+	hash      string
 	signature []byte
 }
 
@@ -44,8 +68,15 @@ type ReplyMsg struct {
 	viewId    int64
 	timestamp int64
 	fromIdx   uint32
-	hash      []byte
+	hash      string
 	signature []byte
+}
+
+type SyncMsg struct {
+	nodeMsg
+	tp   int // tp:0  request sync  tp:1 response sync
+	hash string
+	logs []*ReqMsg
 }
 
 type State struct {
@@ -56,12 +87,34 @@ type State struct {
 	logs []*ReqMsg
 }
 
+func (s State) calcHash() string {
+	var result []byte
+	for _, v := range s.logs {
+		result = append(result, v.hash...)
+	}
+	return calculateHash(result)
+}
+
+func calculateHash(bs []byte) string {
+	h := sha256.New()
+	h.Write(bs)
+	hashed := h.Sum(nil)
+	return hex.EncodeToString(hashed)
+}
+
 // 0. waiting request
 // 1. waiting 2f+1 prepare
 // 2. waiting 2f+1 commit
+// 3. waiting 2f+1 sync
 type CurState struct {
 	cur          int32
+	ppMsg        *PPMsg
 	waitingState *waitingStateImpl
+}
+
+func (cur *CurState) reset() {
+	cur.ppMsg = nil
+	cur.waitingState = nil
 }
 
 func (cur *CurState) switchCur(from int32, to int32) bool {
@@ -70,13 +123,17 @@ func (cur *CurState) switchCur(from int32, to int32) bool {
 
 type waitingStateImpl struct {
 	okCnt     int
-	ppMsg     *PPMsg
-	done      map[uint32]struct{}
+	done      map[string]map[uint32]struct{}
 	timeoutCh chan struct{}
 }
 
-func (s *waitingStateImpl) Done(idx uint32) error {
-	s.done[idx] = struct{}{}
+func (s *waitingStateImpl) Done(key string, idx uint32) error {
+	cnt, ok := s.done[key]
+	if !ok {
+		cnt = make(map[uint32]struct{})
+		s.done[key] = cnt
+	}
+	cnt[idx] = struct{}{}
 	return nil
 }
 
@@ -85,13 +142,14 @@ func (s *waitingStateImpl) Destroy() error {
 	return nil
 }
 
-func (s waitingStateImpl) Ok() bool {
-	return len(s.done) >= s.okCnt
+func (s waitingStateImpl) Ok(key string) bool {
+	cnt := s.done[key]
+	return len(cnt) >= s.okCnt
 }
 
 type WaitingState interface {
-	Ok() bool
-	Done(idx uint32) error
+	Ok(key string) bool
+	Done(key string, idx uint32) error
 	Destroy() error
 }
 
@@ -145,6 +203,8 @@ func (n *Node) loopBuf() error {
 			n.waitingPrepare()
 		} else if n.cur.cur == 2 {
 			n.waitingCommit()
+		} else if n.cur.cur == 3 {
+			n.waitingSync()
 		} else {
 			panic("unknown status")
 		}
@@ -185,6 +245,12 @@ func (n *Node) waitingCommit() (err error) {
 }
 
 func (n *Node) onReceive(msg interface{}) (err error) {
+	if nnMsg, ok := msg.(NodeMsg); ok {
+		if nnMsg.getSeq() > n.state.seq+1 && n.cur.cur == 0 {
+			// trigger sync
+			n.switchToSync()
+		}
+	}
 
 	switch m := msg.(type) {
 	case *ReqMsg:
@@ -205,6 +271,14 @@ func (n *Node) onReceive(msg interface{}) (err error) {
 			n.mBuf.commitBuf.Enqueue(m)
 			//fmt.Printf("[%d]commit msg loss, %v", n.idx, m)
 		}
+	case *SyncMsg:
+		if m.tp == 0 {
+			fmt.Printf("[%d]receive sync request msg:%s\n", n.idx, msg)
+			n.onRequestSyncMsg(m)
+		} else {
+			fmt.Printf("[%d]receive sync response msg:%s\n", n.idx, msg)
+			n.mBuf.syncBuf.Enqueue(m)
+		}
 	}
 	return
 }
@@ -218,11 +292,13 @@ func (n *Node) onRequestMsg(m *ReqMsg) error {
 		return nil
 	}
 	pp := &PPMsg{
+		nodeMsg: nodeMsg{
+			viewId:  n.state.viewId,
+			seq:     n.state.seq + 1,
+			fromIdx: n.idx,
+		},
 		requests:  m,
-		viewId:    n.state.viewId,
-		seq:       n.state.seq + 1,
-		hash:      []byte(m.operation),
-		fromIdx:   n.idx,
+		hash:      calculateHash([]byte(m.operation)),
 		signature: nil,
 	}
 	err := n.switchToPrepare(pp)
@@ -237,7 +313,7 @@ func (n *Node) onRequestMsg(m *ReqMsg) error {
 func (n *Node) prepareTimeout() error {
 	flag := n.cur.switchCur(1, 0)
 	if flag {
-		n.cur.waitingState = nil
+		n.cur.reset()
 	}
 	return nil
 }
@@ -245,7 +321,15 @@ func (n *Node) prepareTimeout() error {
 func (n *Node) commitTimeout() error {
 	flag := n.cur.switchCur(2, 0)
 	if flag {
-		n.cur.waitingState = nil
+		n.cur.reset()
+	}
+	return nil
+}
+
+func (n *Node) syncTimeout() error {
+	flag := n.cur.switchCur(3, 0)
+	if flag {
+		n.cur.reset()
 	}
 	return nil
 }
@@ -257,12 +341,13 @@ func (n *Node) switchToPrepare(msg *PPMsg) error {
 	}
 
 	n.cur.waitingState = &waitingStateImpl{
-		okCnt:     2*n.f + 1,
-		ppMsg:     msg,
-		done:      make(map[uint32]struct{}),
+		okCnt: 2*n.f + 1,
+
+		done:      make(map[string]map[uint32]struct{}),
 		timeoutCh: make(chan struct{}),
 	}
-	n.cur.waitingState.Done(n.idx)
+	n.cur.ppMsg = msg
+	n.cur.waitingState.Done("", n.idx)
 	go func(closed chan struct{}) {
 		select {
 		case <-time.After(10 * time.Second):
@@ -280,9 +365,62 @@ func (n *Node) apply(msg *PPMsg) error {
 	}
 
 	n.cur.waitingState.Destroy()
-	n.cur.waitingState = nil
+	n.cur.reset()
 	n.state.seq = msg.seq
 	n.state.logs = append(n.state.logs, msg.requests)
+	return nil
+}
+
+func (n *Node) syncSuccess(msg *SyncMsg) error {
+	flag := n.cur.switchCur(3, 0)
+	if !flag {
+		return errors.Errorf("switch fail.")
+	}
+
+	n.cur.waitingState.Destroy()
+	n.cur.reset()
+	n.state.seq = msg.seq
+	var logs []*ReqMsg
+	for _, v := range msg.logs {
+		logs = append(logs, v)
+	}
+	n.state.logs = logs
+	fmt.Printf("sync success, seq:%d.\n", msg.seq)
+	return nil
+}
+
+func (n *Node) switchToSync() error {
+	flag := n.cur.switchCur(0, 3)
+	if !flag {
+		return errors.Errorf("switch fail.")
+	}
+
+	n.cur.waitingState = &waitingStateImpl{
+		okCnt:     2*n.f + 1,
+		done:      make(map[string]map[uint32]struct{}),
+		timeoutCh: make(chan struct{}),
+	}
+
+	go func(closed chan struct{}) {
+		select {
+		case <-time.After(10 * time.Second):
+			n.syncTimeout()
+		case <-closed:
+		}
+	}(n.cur.waitingState.timeoutCh)
+
+	msg := &SyncMsg{
+		nodeMsg: nodeMsg{
+			viewId:  n.state.viewId,
+			seq:     n.state.seq,
+			fromIdx: n.idx,
+		},
+		tp:   0,
+		hash: "",
+		logs: nil,
+	}
+
+	n.broadcast(msg)
 	return nil
 }
 
@@ -296,11 +434,11 @@ func (n *Node) switchToCommit(msg *PPMsg) error {
 
 	n.cur.waitingState = &waitingStateImpl{
 		okCnt:     2*n.f + 1,
-		ppMsg:     msg,
-		done:      make(map[uint32]struct{}),
+		done:      make(map[string]map[uint32]struct{}),
 		timeoutCh: make(chan struct{}),
 	}
-	n.cur.waitingState.Done(n.idx)
+	n.cur.ppMsg = msg
+	n.cur.waitingState.Done("", n.idx)
 	go func(closed chan struct{}) {
 		select {
 		case <-time.After(10 * time.Second):
@@ -360,13 +498,15 @@ func (n *Node) onPrePrepareMsg(m *PPMsg) error {
 		log15.Error(err.Error())
 		return nil
 	}
-	n.cur.waitingState.Done(m.fromIdx)
+	n.cur.waitingState.Done("", m.fromIdx)
 	msg := &BFTMsg{
+		nodeMsg: nodeMsg{
+			viewId:  m.viewId,
+			seq:     m.seq,
+			fromIdx: n.idx,
+		},
 		tp:        0,
-		viewId:    m.viewId,
-		seq:       m.seq,
 		hash:      m.hash,
-		fromIdx:   n.idx,
 		signature: nil,
 	}
 	n.broadcast(msg)
@@ -380,23 +520,25 @@ func (n *Node) onPrepareMsg(m *BFTMsg) error {
 		return nil
 	}
 
-	pp := n.cur.waitingState.ppMsg
-	if bytes.Equal(pp.hash, m.hash) &&
+	pp := n.cur.ppMsg
+	if pp.hash == m.hash &&
 		pp.seq == m.seq &&
 		pp.viewId == m.viewId {
-		n.cur.waitingState.Done(m.fromIdx)
-		if n.cur.waitingState.Ok() {
+		n.cur.waitingState.Done("", m.fromIdx)
+		if n.cur.waitingState.Ok("") {
 			err := n.switchToCommit(pp)
 			if err != nil {
 				log15.Error(err.Error())
 				return nil
 			}
 			msg := &BFTMsg{
+				nodeMsg: nodeMsg{
+					viewId:  m.viewId,
+					seq:     m.seq,
+					fromIdx: n.idx,
+				},
 				tp:        1,
-				viewId:    m.viewId,
-				seq:       m.seq,
 				hash:      m.hash,
-				fromIdx:   n.idx,
 				signature: nil,
 			}
 			n.broadcast(msg)
@@ -413,12 +555,12 @@ func (n *Node) onCommitMsg(m *BFTMsg) error {
 		return nil
 	}
 
-	pp := n.cur.waitingState.ppMsg
-	if bytes.Equal(pp.hash, m.hash) &&
+	pp := n.cur.ppMsg
+	if pp.hash == m.hash &&
 		pp.seq == m.seq &&
 		pp.viewId == m.viewId {
-		n.cur.waitingState.Done(m.fromIdx)
-		if n.cur.waitingState.Ok() {
+		n.cur.waitingState.Done("", m.fromIdx)
+		if n.cur.waitingState.Ok("") {
 			err := n.apply(pp)
 			if err != nil {
 				return nil
@@ -438,6 +580,52 @@ func (n *Node) onCommitMsg(m *BFTMsg) error {
 	}
 }
 
+func (n *Node) onRequestSyncMsg(m *SyncMsg) error {
+	fmt.Printf("[%d]on sync request msg:%v\n", n.idx, m)
+	if m.viewId != n.state.viewId {
+		return nil
+	}
+	result := &SyncMsg{
+		nodeMsg: nodeMsg{
+			viewId:  n.state.viewId,
+			seq:     n.state.seq,
+			fromIdx: n.idx,
+		},
+		tp:   1,
+		hash: n.state.calcHash(),
+		logs: n.state.logs,
+	}
+
+	err := n.net.SendTo(n.idx, m.fromIdx, result)
+	if err != nil {
+		log15.Error(fmt.Sprintf("Send msg error %s - %d", err.Error(), n.idx))
+	}
+	return nil
+}
+
+func (n *Node) onResponseSyncMsg(m *SyncMsg) error {
+	fmt.Printf("[%d]on sync response msg:%v\n", n.idx, m)
+
+	impl := n.cur.waitingState
+	if impl == nil {
+		return nil
+	}
+	key := fmt.Sprintf("%d-%s", m.seq, m.hash)
+	impl.Done(key, m.fromIdx)
+	if impl.Ok(key) {
+		n.syncSuccess(m)
+	}
+	return nil
+}
+
+func (n *Node) waitingSync() error {
+	for n.mBuf.syncBuf.Len() > 0 {
+		m := n.mBuf.syncBuf.Dequeue().(*SyncMsg)
+		n.onResponseSyncMsg(m)
+	}
+	return nil
+}
+
 type Cli struct {
 	clusterSize int32
 	f           int
@@ -449,6 +637,7 @@ type Cli struct {
 	net Net
 
 	waitingReply *waitingStateImpl
+	cur          *ReqMsg
 }
 
 func (c Cli) calcPrimary() uint32 {
@@ -464,14 +653,13 @@ func (c *Cli) SendRequest(op string) error {
 		operation: op,
 		timestamp: time.Now().Unix(),
 		owner:     c.idx,
+		hash:      calculateHash([]byte(op)),
 	}
+	c.cur = msg
 
 	c.waitingReply = &waitingStateImpl{
-		okCnt: c.f + 1,
-		ppMsg: &PPMsg{
-			hash: []byte(op),
-		},
-		done:      make(map[uint32]struct{}),
+		okCnt:     c.f + 1,
+		done:      make(map[string]map[uint32]struct{}),
 		timeoutCh: make(chan struct{}),
 	}
 
@@ -496,6 +684,7 @@ func (c *Cli) SendRequest(op string) error {
 	//ch <- msg
 	err := <-waitingCh
 	c.waitingReply = nil
+	c.cur = nil
 	return err
 }
 
@@ -530,12 +719,13 @@ func (c *Cli) onReceive(msg interface{}) (err error) {
 
 func (c *Cli) onReplyMsg(m *ReplyMsg) error {
 	impl := c.waitingReply
-	if impl == nil {
+	if impl == nil || c.cur == nil {
 		return nil
 	}
-	if bytes.Equal(impl.ppMsg.hash, m.hash) {
-		impl.Done(m.fromIdx)
-		if impl.Ok() {
+
+	if c.cur.hash == m.hash {
+		impl.Done("", m.fromIdx)
+		if impl.Ok("") {
 			impl.Destroy()
 		}
 	}
@@ -546,6 +736,7 @@ func (c *Cli) onReplyMsg(m *ReplyMsg) error {
 
 type msgBuffer struct {
 	// viewId + hash
+	syncBuf    *queue.Queue
 	reqBuf     *queue.Queue
 	ppBuf      *queue.Queue
 	prepareBuf *queue.Queue

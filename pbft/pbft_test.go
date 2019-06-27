@@ -2,6 +2,9 @@ package pbft
 
 import (
 	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
 
 	"github.com/golang-collections/collections/queue"
 )
@@ -30,6 +33,7 @@ func TestPbft(t *testing.T) {
 			cur:     &CurState{},
 			net:     nn,
 			mBuf: &msgBuffer{
+				syncBuf:    queue.New(),
 				reqBuf:     queue.New(),
 				ppBuf:      queue.New(),
 				prepareBuf: queue.New(),
@@ -89,4 +93,34 @@ func TestPbft(t *testing.T) {
 	for _, v := range nodes {
 		t.Log(v.idx, v.cur.cur, v.state.seq, len(v.state.logs))
 	}
+
+	nodes[1].down = false
+
+	err = c.SendRequest("hello world2")
+	if err != nil {
+		t.Error(err)
+		t.FailNow()
+	}
+
+	ok := true
+	s := int64(-1)
+
+	for i := 0; i < 10; i++ {
+		for _, v := range nodes {
+			if s < 0 {
+				s = v.state.seq
+			}
+			if s != v.state.seq {
+				ok = false
+			}
+			t.Log(v.idx, v.cur.cur, v.state.seq, len(v.state.logs))
+		}
+		if ok {
+			break
+		}
+		ok = true
+		time.Sleep(time.Second)
+	}
+
+	assert.True(t, ok)
 }
