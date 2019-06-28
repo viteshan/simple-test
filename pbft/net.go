@@ -15,6 +15,8 @@ type Net interface {
 
 	Register(id uint32, wCh chan<- interface{}) error
 	UnRegister(id uint32) error
+
+	SetStatus(idx uint32, flag bool) // true:up false:down
 }
 
 type net struct {
@@ -22,6 +24,7 @@ type net struct {
 	channelsMu sync.Mutex
 
 	nodes map[uint32]chan<- interface{}
+	status map[uint32]bool
 }
 
 type msgWrapper struct {
@@ -35,6 +38,7 @@ func newNet() *net {
 	return &net{
 		channels: make(map[string]chan *msgWrapper),
 		nodes:    make(map[uint32]chan<- interface{}),
+		status: make(map[uint32]bool),
 	}
 }
 
@@ -50,7 +54,18 @@ func (n *net) getChannel(key string, toId uint32) chan *msgWrapper {
 	return ch
 }
 
+func (n *net) SetStatus(idx uint32, flag bool)  {
+	n.status[idx] = flag
+}
+
 func (n *net) SendTo(fromId uint32, toId uint32, msg interface{}) error {
+
+	_, ok := n.status[toId]
+	if ok && !n.status[toId] {
+		return errors.New("Node is down")
+	}
+
+
 	if !n.exist(fromId) {
 		return errors.New("from is not exist")
 	}

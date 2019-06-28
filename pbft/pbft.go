@@ -83,6 +83,14 @@ type SyncMsg struct {
 	logs []*ReqMsg
 }
 
+type ViewChangeMsg struct {
+	nodeMsg
+}
+
+type NewViewMsg struct {
+	nodeMsg
+}
+
 type State struct {
 	viewId int64
 	seq    int64
@@ -124,6 +132,7 @@ func calculateHash(bs []byte) string {
 // 0. waiting request
 // 1. waiting 2f+1 prepare
 // 2. waiting 2f+1 commit
+// 3. waiting 2f+1 view change
 type CurState struct {
 	cur          int32
 	ppMsg        *PPMsg
@@ -241,6 +250,8 @@ func (n *Node) loopBuf() error {
 			n.waitingPrepare()
 		} else if n.cur.cur == 2 {
 			n.waitingCommit()
+		} else if n.cur.cur == 3 {
+			n.waitingViewChange()
 		} else {
 			panic("unknown status")
 		}
@@ -258,6 +269,11 @@ func (n *Node) waitingRequestForPrimary() (err error) {
 }
 
 func (n *Node) waitingRequest() (err error) {
+	for n.mBuf.reqBuf.Len() > 0 {
+		m := n.mBuf.reqBuf.Dequeue().(*ReqMsg)
+		n.onRequestMsg(m)
+	}
+
 	for n.mBuf.ppBuf.Len() > 0 {
 		m := n.mBuf.ppBuf.Dequeue().(*PPMsg)
 		n.onPrePrepareMsg(m)
@@ -277,6 +293,18 @@ func (n *Node) waitingCommit() (err error) {
 	for n.mBuf.commitBuf.Len() > 0 {
 		m := n.mBuf.commitBuf.Dequeue().(*BFTMsg)
 		n.onCommitMsg(m)
+	}
+	return nil
+}
+
+func (n *Node) waitingViewChange() (err error) {
+	for n.mBuf.vcBUf.Len() > 0 {
+		m := n.mBuf.vcBUf.Dequeue().(*ViewChangeMsg)
+		n.onViewChangeMsg(m)
+	}
+	for n.mBuf.newViewBuf.Len()>0{
+		m := n.mBuf.newViewBuf.Dequeue().(*NewViewMsg)
+		n.onNewViewMsg(m)
 	}
 	return nil
 }
@@ -349,13 +377,21 @@ func (n *Node) onReceive(msg interface{}) (err error) {
 			fmt.Printf("[%d]receive sync response msg:%s\n", n.idx, msg)
 			n.mBuf.syncBuf.Enqueue(m)
 		}
+	case *ViewChangeMsg:
+		fmt.Printf("[%d]receive view change msg:%s\n", n.idx, msg)
+		n.mBuf.vcBUf.Enqueue(m)
+	case *NewViewMsg:
+		fmt.Printf("[%d]receive new view msg:%s\n", n.idx, msg)
+		n.mBuf.newViewBuf.Enqueue(m)
 	case *HeartBeatMsg:
+
 	}
 	return
 }
 func (n *Node) onRequestMsg(m *ReqMsg) error {
 	fmt.Printf("[%d]on request msg:%v\n", n.idx, m)
 	if !n.isPrimary() {
+		n.switchToViewChange(0, n.state.viewId+1)
 		return nil
 	}
 
@@ -382,19 +418,16 @@ func (n *Node) onRequestMsg(m *ReqMsg) error {
 }
 
 func (n *Node) prepareTimeout() error {
-	flag := n.cur.switchCur(1, 0)
-	if flag {
-		n.cur.reset()
-	}
-	return nil
+	return n.switchToViewChange(1, n.state.viewId+1)
+}
+
+func (n *Node) viewChangeTimeout(viewId int64) error {
+
+	return n.switchToViewChange(3, viewId+1)
 }
 
 func (n *Node) commitTimeout() error {
-	flag := n.cur.switchCur(2, 0)
-	if flag {
-		n.cur.reset()
-	}
-	return nil
+	return n.switchToViewChange(2, n.state.viewId+1)
 }
 
 func (n *Node) syncTimeout() error {
@@ -429,6 +462,46 @@ func (n *Node) switchToPrepare(msg *PPMsg) error {
 	return nil
 }
 
+// 1. prepare
+// 2. commit
+// 3. self timeout
+func (n *Node) switchToViewChange(tp int32, newViewId int64) error {
+	flag := n.cur.switchCur(tp, 3)
+	if !flag {
+		return errors.Errorf("switch fail.")
+	}
+
+	n.cur.reset()
+
+	n.cur.waitingState = &stateCounterImpl{
+		okCnt: 2*n.f + 1,
+
+		done:      make(map[string]map[uint32]struct{}),
+		timeoutCh: make(chan struct{}),
+	}
+
+	n.cur.waitingState.Done("", n.idx)
+	go func(closed chan struct{}) {
+		select {
+		case <-time.After(10 * time.Second):
+			n.viewChangeTimeout(newViewId)
+		case <-closed:
+		}
+	}(n.cur.waitingState.timeoutCh)
+
+	vcmsg := &ViewChangeMsg{
+		nodeMsg: nodeMsg{
+			viewId:  newViewId,
+			seq:     n.state.seq,
+			fromIdx: n.idx,
+		},
+	}
+	n.broadcast(vcmsg)
+
+	return nil
+
+}
+
 func (n *Node) apply(msg *PPMsg) error {
 	flag := n.cur.switchCur(2, 0)
 	if !flag {
@@ -442,7 +515,20 @@ func (n *Node) apply(msg *PPMsg) error {
 	return nil
 }
 
+func (n *Node) newViewApply(msg *NewViewMsg) error {
+	flag := n.cur.switchCur(3, 0)
+	if !flag {
+		return errors.Errorf("switch fail.")
+	}
+
+	n.cur.waitingState.Destroy()
+	n.cur.reset()
+	n.state.viewId = msg.viewId
+	return nil
+}
+
 func (n *Node) syncSuccess(msg *SyncMsg) error {
+
 	if n.cur.cur != 0 {
 		flag := n.cur.switchCur(n.cur.cur, 0)
 		if !flag {
@@ -605,6 +691,42 @@ func (n *Node) onPrepareMsg(m *BFTMsg) error {
 	}
 }
 
+func (n *Node) onViewChangeMsg(m *ViewChangeMsg) error {
+	fmt.Printf("[%d]on viewChange msg:%v\n", n.idx, m)
+	if n.cur.cur != 3 {
+		return nil
+	}
+
+	if calcPrimary(m.viewId, n.clusterSize) != n.idx {
+		return nil
+	}
+
+	n.cur.waitingState.Done("", m.fromIdx)
+	if n.cur.waitingState.Ok("") {
+		newViewMsg := &NewViewMsg{
+			nodeMsg: nodeMsg{
+				viewId:  m.viewId,
+				seq:     m.seq,
+				fromIdx: n.idx,
+			},
+		}
+
+		n.newViewApply(newViewMsg)
+		n.broadcast(newViewMsg)
+	}
+	return nil
+}
+
+func (n *Node) onNewViewMsg(msg *NewViewMsg) error {
+	fmt.Printf("[%d]on newView msg:%v\n", n.idx, msg)
+
+	if n.cur.cur != 3 {
+		return nil
+	}
+	n.newViewApply(msg)
+	return nil
+}
+
 func (n *Node) onCommitMsg(m *BFTMsg) error {
 	fmt.Printf("[%d]on commit msg:%v\n", n.idx, m)
 	if n.cur.cur != 2 {
@@ -699,8 +821,8 @@ type Cli struct {
 	cur          *ReqMsg
 }
 
-func (c Cli) calcPrimary() uint32 {
-	return uint32(c.viewId % int64(c.clusterSize))
+func calcPrimary(viewId int64, clusterSize int32) uint32 {
+	return uint32(viewId % int64(clusterSize))
 
 }
 
@@ -732,11 +854,17 @@ func (c *Cli) SendRequest(op string) error {
 			close(waitingCh)
 		}
 	}(c.waitingReply.timeoutCh)
-	primary := c.calcPrimary()
+	primary := calcPrimary(c.viewId, c.clusterSize)
 	node := c.peers[primary]
 
 	errMsg := c.net.SendTo(c.idx, node.idx, msg)
 	if errMsg != nil {
+		for _, v := range c.peers {
+			if v.idx == node.idx {
+				continue
+			}
+			c.net.SendTo(c.idx, v.idx, msg)
+		}
 		return errMsg
 	}
 	//ch, _ := node.GetCh()
@@ -801,4 +929,6 @@ type msgBuffer struct {
 	prepareBuf *queue.Queue
 	commitBuf  *queue.Queue
 	replyBuf   *queue.Queue
+	vcBUf      *queue.Queue // view change buf
+	newViewBuf *queue.Queue // new view buf
 }
