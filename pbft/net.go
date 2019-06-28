@@ -3,6 +3,7 @@ package pbft
 import (
 	"fmt"
 	"math/rand"
+	"sync"
 	"time"
 
 	"github.com/vitelabs/go-vite/log15"
@@ -17,7 +18,8 @@ type Net interface {
 }
 
 type net struct {
-	channels map[string]chan *msgWrapper
+	channels   map[string]chan *msgWrapper
+	channelsMu sync.Mutex
 
 	nodes map[uint32]chan<- interface{}
 }
@@ -36,6 +38,18 @@ func newNet() *net {
 	}
 }
 
+func (n *net) getChannel(key string, toId uint32) chan *msgWrapper {
+	n.channelsMu.Lock()
+	defer n.channelsMu.Unlock()
+
+	ch, ok := n.channels[key]
+	if !ok {
+		ch = n.newChannel(toId)
+		n.channels[key] = ch
+	}
+	return ch
+}
+
 func (n *net) SendTo(fromId uint32, toId uint32, msg interface{}) error {
 	if !n.exist(fromId) {
 		return errors.New("from is not exist")
@@ -46,11 +60,7 @@ func (n *net) SendTo(fromId uint32, toId uint32, msg interface{}) error {
 
 	key := fmt.Sprintf("%d-%d", fromId, toId)
 
-	ch, ok := n.channels[key]
-	if !ok {
-		ch = n.newChannel(toId)
-		n.channels[key] = ch
-	}
+	ch := n.getChannel(key, toId)
 	select {
 	case ch <- &msgWrapper{
 		msg:     msg,

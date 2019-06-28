@@ -99,6 +99,21 @@ func (s State) calcHash() string {
 	return calculateHash(result)
 }
 
+func (s State) getLogsBySeq(seq int64) (result []*ReqMsg, hash string) {
+	for k, v := range s.logs {
+		if int64(k) < seq {
+			result = append(result, v)
+		}
+
+	}
+	var byt []byte
+	for _, v := range result {
+		byt = append(byt, v.hash...)
+	}
+	hash = calculateHash(byt)
+	return
+}
+
 func calculateHash(bs []byte) string {
 	h := sha256.New()
 	h.Write(bs)
@@ -109,7 +124,6 @@ func calculateHash(bs []byte) string {
 // 0. waiting request
 // 1. waiting 2f+1 prepare
 // 2. waiting 2f+1 commit
-// 3. waiting 2f+1 sync
 type CurState struct {
 	cur          int32
 	ppMsg        *PPMsg
@@ -176,7 +190,10 @@ type Node struct {
 
 	cur *CurState
 
+	// key: sync:{seq}-{hash}  ->  counter sync response
+	// key: seq:{seq}   -> counter sync request trigger
 	syncCounter *stateCounterImpl
+	timeout     Blacklist
 }
 
 func (n *Node) GetCh() (chan<- interface{}, error) {
@@ -187,7 +204,7 @@ func (n *Node) loopHeartBeat() error {
 	for {
 		time.Sleep(2 * time.Second)
 		s := *n.state
-		msg := HeartBeatMsg{
+		msg := &HeartBeatMsg{
 			nodeMsg: nodeMsg{
 				viewId:  s.viewId,
 				seq:     s.seq,
@@ -224,11 +241,10 @@ func (n *Node) loopBuf() error {
 			n.waitingPrepare()
 		} else if n.cur.cur == 2 {
 			n.waitingCommit()
-		} else if n.cur.cur == 3 {
-			n.waitingSync()
 		} else {
 			panic("unknown status")
 		}
+		n.waitingSync()
 		time.Sleep(20 * time.Millisecond)
 	}
 }
@@ -265,27 +281,46 @@ func (n *Node) waitingCommit() (err error) {
 	return nil
 }
 
-func (n *Node) onReceive(msg interface{}) (err error) {
+func (n *Node) intercept(msg interface{}) error {
 	if nnMsg, ok := msg.(NodeMsg); ok {
+		if _, ok := msg.(*SyncMsg); ok {
+			return nil
+		}
 
 		if _, ok := msg.(*HeartBeatMsg); ok {
+			fmt.Printf("[%d]receive heartbeat msg:%v\n", n.idx, msg)
 			if nnMsg.getSeq() > n.state.seq && n.cur.cur == 0 {
 				key := fmt.Sprintf("seq:%d", nnMsg.getSeq())
+				if n.timeout.Exists(key) {
+					return nil
+				}
 				n.syncCounter.Done(key, nnMsg.getFromIdx())
 				if n.syncCounter.Ok(key) {
-					n.switchToSync()
+					n.timeout.AddAddTimeout(key, time.Second*10)
+					n.syncTo(nnMsg.getSeq())
 				}
 			}
 		} else {
 			if nnMsg.getSeq() > n.state.seq+1 && n.cur.cur == 0 {
-				key := fmt.Sprintf("seq:%d", nnMsg.getSeq())
+				key := fmt.Sprintf("seq:%d", nnMsg.getSeq()-1)
+				if n.timeout.Exists(key) {
+					return nil
+				}
 				n.syncCounter.Done(key, nnMsg.getFromIdx())
 				if n.syncCounter.Ok(key) {
-					n.switchToSync()
+					n.timeout.AddAddTimeout(key, time.Second*10)
+					n.syncTo(nnMsg.getSeq() - 1)
 				}
 			}
 		}
 	}
+	return nil
+}
+
+func (n *Node) onReceive(msg interface{}) (err error) {
+
+	// todo
+	n.intercept(msg)
 
 	switch m := msg.(type) {
 	case *ReqMsg:
@@ -408,12 +443,16 @@ func (n *Node) apply(msg *PPMsg) error {
 }
 
 func (n *Node) syncSuccess(msg *SyncMsg) error {
-	flag := n.cur.switchCur(3, 0)
-	if !flag {
-		return errors.Errorf("switch fail.")
+	if n.cur.cur != 0 {
+		flag := n.cur.switchCur(n.cur.cur, 0)
+		if !flag {
+			return errors.Errorf("switch fail.")
+		}
 	}
 
-	n.cur.waitingState.Destroy()
+	if n.cur.waitingState != nil {
+		n.cur.waitingState.Destroy()
+	}
 	n.cur.reset()
 	n.state.seq = msg.seq
 	var logs []*ReqMsg
@@ -425,30 +464,11 @@ func (n *Node) syncSuccess(msg *SyncMsg) error {
 	return nil
 }
 
-func (n *Node) switchToSync() error {
-	flag := n.cur.switchCur(0, 3)
-	if !flag {
-		return errors.Errorf("switch fail.")
-	}
-
-	n.cur.waitingState = &stateCounterImpl{
-		okCnt:     2*n.f + 1,
-		done:      make(map[string]map[uint32]struct{}),
-		timeoutCh: make(chan struct{}),
-	}
-
-	go func(closed chan struct{}) {
-		select {
-		case <-time.After(3 * time.Second):
-			n.syncTimeout()
-		case <-closed:
-		}
-	}(n.cur.waitingState.timeoutCh)
-
+func (n *Node) syncTo(targetSeq int64) error {
 	msg := &SyncMsg{
 		nodeMsg: nodeMsg{
 			viewId:  n.state.viewId,
-			seq:     n.state.seq,
+			seq:     targetSeq,
 			fromIdx: n.idx,
 		},
 		tp:   0,
@@ -621,15 +641,20 @@ func (n *Node) onRequestSyncMsg(m *SyncMsg) error {
 	if m.viewId != n.state.viewId {
 		return nil
 	}
+	if m.seq > n.state.seq {
+		return nil
+	}
+	logs, hash := n.state.getLogsBySeq(m.seq)
+
 	result := &SyncMsg{
 		nodeMsg: nodeMsg{
 			viewId:  n.state.viewId,
-			seq:     n.state.seq,
+			seq:     m.seq,
 			fromIdx: n.idx,
 		},
 		tp:   1,
-		hash: n.state.calcHash(),
-		logs: n.state.logs,
+		hash: hash,
+		logs: logs,
 	}
 
 	err := n.net.SendTo(n.idx, m.fromIdx, result)
@@ -641,14 +666,12 @@ func (n *Node) onRequestSyncMsg(m *SyncMsg) error {
 
 func (n *Node) onResponseSyncMsg(m *SyncMsg) error {
 	fmt.Printf("[%d]on sync response msg:%v\n", n.idx, m)
-
-	impl := n.cur.waitingState
-	if impl == nil {
+	if m.seq <= n.state.seq {
 		return nil
 	}
-	key := fmt.Sprintf("%d-%s", m.seq, m.hash)
-	impl.Done(key, m.fromIdx)
-	if impl.Ok(key) {
+	key := fmt.Sprintf("sync:%d-%s", m.seq, m.hash)
+	n.syncCounter.Done(key, m.fromIdx)
+	if n.syncCounter.Ok(key) {
 		n.syncSuccess(m)
 	}
 	return nil

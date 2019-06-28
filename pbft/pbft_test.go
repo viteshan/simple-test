@@ -18,6 +18,10 @@ func TestPbft(t *testing.T) {
 	var nodes []*Node
 	for i := int32(0); i < clusterSize; i++ {
 		var logs []*ReqMsg
+		blacklist, err := NewBlacklist()
+		if err != nil {
+			t.Fatal(err)
+		}
 		n := &Node{
 			clusterSize: clusterSize,
 			f:           f,
@@ -45,9 +49,10 @@ func TestPbft(t *testing.T) {
 				done:      make(map[string]map[uint32]struct{}),
 				timeoutCh: nil,
 			},
+			timeout: blacklist,
 		}
 
-		err := nn.Register(n.idx, n.ch)
+		err = nn.Register(n.idx, n.ch)
 		if err != nil {
 			t.Error("Register error ", err)
 			t.FailNow()
