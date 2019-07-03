@@ -141,8 +141,8 @@ func TestPbftViewChange(t *testing.T) {
 
 	nn := newNet()
 
-	clusterSize := int32(4)
-	f := int(1)
+	clusterSize := int32(7)
+	f := int(2)
 	var nodes []*Node
 	for i := int32(0); i < clusterSize; i++ {
 		var logs []*ReqMsg
@@ -179,7 +179,8 @@ func TestPbftViewChange(t *testing.T) {
 				done:      make(map[string]map[uint32]struct{}),
 				timeoutCh: nil,
 			},
-			timeout: blacklist,
+			timeout:       blacklist,
+			viewTimeoutCh: make(map[string]chan struct{}),
 		}
 
 		err = nn.Register(n.idx, n.ch)
@@ -224,7 +225,9 @@ func TestPbftViewChange(t *testing.T) {
 	}
 
 	nodes[0].down = true
+	nodes[1].down = true
 	nn.SetStatus(0, false)
+	nn.SetStatus(1, false)
 	err := c.SendRequest("hello")
 
 	if err != nil {
@@ -236,17 +239,15 @@ func TestPbftViewChange(t *testing.T) {
 		t.Log(v.idx, v.cur.cur, v.state.seq, len(v.state.logs), v.state.viewId)
 	}
 
-	nodes[0].down = false
-
 	ok := true
 
-	for i := 0; i < 10; i++ {
+	for i := 0; i < 30; i++ {
 		ok = true
 		for _, v := range nodes {
-			if v.idx == 0 {
+			if v.idx == 0 || v.idx == 1 {
 				continue
 			}
-			if v.state.viewId != 1 {
+			if v.state.viewId != 2 {
 				ok = false
 			}
 			t.Log(v.idx, v.cur.cur, v.state.seq, len(v.state.logs), v.state.viewId)
@@ -257,4 +258,27 @@ func TestPbftViewChange(t *testing.T) {
 		time.Sleep(time.Second)
 	}
 	assert.True(t, ok)
+
+	nodes[0].down = false
+	nodes[1].down = false
+	nn.SetStatus(0, true)
+	nn.SetStatus(1, true)
+
+	ok = true
+
+	for i := 0; i < 30; i++ {
+		ok = true
+		for _, v := range nodes {
+			if v.state.viewId != 2 {
+				ok = false
+			}
+			t.Log(v.idx, v.cur.cur, v.state.seq, len(v.state.logs), v.state.viewId)
+		}
+		if ok {
+			break
+		}
+		time.Sleep(time.Second)
+	}
+	assert.True(t, ok)
+
 }

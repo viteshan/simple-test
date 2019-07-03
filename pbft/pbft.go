@@ -28,6 +28,9 @@ type NodeMsg interface {
 	getFromIdx() uint32
 }
 
+type SyncSign interface {
+}
+
 type nodeMsg struct {
 	NodeMsg
 	viewId  int64
@@ -47,12 +50,18 @@ func (m nodeMsg) getFromIdx() uint32 {
 	return m.fromIdx
 }
 
+type PrimaryDown struct {
+	nodeMsg
+}
+
 type HeartBeatMsg struct {
+	SyncSign
 	nodeMsg
 }
 
 // just from master
 type PPMsg struct {
+	SyncSign
 	nodeMsg
 	requests  *ReqMsg
 	hash      string // requests
@@ -61,6 +70,7 @@ type PPMsg struct {
 
 // 2f + 1
 type BFTMsg struct {
+	SyncSign
 	nodeMsg
 	tp        int // tp:0  prepare-message   tp:1  commit-message
 	hash      string
@@ -78,7 +88,7 @@ type ReplyMsg struct {
 
 type SyncMsg struct {
 	nodeMsg
-	tp   int // tp:0  request sync  tp:1 response sync
+	req  bool // req:true  request sync  req:false response sync
 	hash string
 	logs []*ReqMsg
 }
@@ -155,6 +165,7 @@ type stateCounterImpl struct {
 }
 
 func (s *stateCounterImpl) Done(key string, idx uint32) error {
+	fmt.Printf("%s_%d done\n", key, idx)
 	cnt, ok := s.done[key]
 	if !ok {
 		cnt = make(map[uint32]struct{})
@@ -201,8 +212,11 @@ type Node struct {
 
 	// key: sync:{seq}-{hash}  ->  counter sync response
 	// key: seq:{seq}   -> counter sync request trigger
+	// key: primaryDown:{viewId} -> primary down for viewId
 	syncCounter *stateCounterImpl
 	timeout     Blacklist
+
+	viewTimeoutCh map[string]chan struct{}
 }
 
 func (n *Node) GetCh() (chan<- interface{}, error) {
@@ -256,6 +270,7 @@ func (n *Node) loopBuf() error {
 			panic("unknown status")
 		}
 		n.waitingSync()
+		n.waitingNewView()
 		time.Sleep(20 * time.Millisecond)
 	}
 }
@@ -302,22 +317,39 @@ func (n *Node) waitingViewChange() (err error) {
 		m := n.mBuf.vcBUf.Dequeue().(*ViewChangeMsg)
 		n.onViewChangeMsg(m)
 	}
-	for n.mBuf.newViewBuf.Len()>0{
-		m := n.mBuf.newViewBuf.Dequeue().(*NewViewMsg)
-		n.onNewViewMsg(m)
-	}
 	return nil
 }
 
 func (n *Node) intercept(msg interface{}) error {
+	if _, ok := msg.(SyncSign); !ok {
+		return nil
+	}
+	if n.cur.cur != 0 {
+		return nil
+	}
 	if nnMsg, ok := msg.(NodeMsg); ok {
-		if _, ok := msg.(*SyncMsg); ok {
-			return nil
+
+		if nnMsg.getViewId() > n.state.viewId {
+			key := fmt.Sprintf("viewId:%d", nnMsg.getViewId())
+			if n.timeout.Exists(key) {
+				return nil
+			}
+			n.syncCounter.Done(key, nnMsg.getFromIdx())
+			if n.syncCounter.Ok(key) {
+				n.timeout.AddAddTimeout(key, time.Second*10)
+				n.newViewApply(n.cur.cur, &NewViewMsg{
+					nodeMsg: nodeMsg{
+						viewId:  nnMsg.getViewId(),
+						seq:     nnMsg.getSeq(),
+						fromIdx: nnMsg.getFromIdx(),
+					},
+				})
+			}
 		}
 
 		if _, ok := msg.(*HeartBeatMsg); ok {
 			fmt.Printf("[%d]receive heartbeat msg:%v\n", n.idx, msg)
-			if nnMsg.getSeq() > n.state.seq && n.cur.cur == 0 {
+			if nnMsg.getSeq() > n.state.seq {
 				key := fmt.Sprintf("seq:%d", nnMsg.getSeq())
 				if n.timeout.Exists(key) {
 					return nil
@@ -325,11 +357,11 @@ func (n *Node) intercept(msg interface{}) error {
 				n.syncCounter.Done(key, nnMsg.getFromIdx())
 				if n.syncCounter.Ok(key) {
 					n.timeout.AddAddTimeout(key, time.Second*10)
-					n.syncTo(nnMsg.getSeq())
+					n.syncLogsTo(nnMsg.getSeq())
 				}
 			}
 		} else {
-			if nnMsg.getSeq() > n.state.seq+1 && n.cur.cur == 0 {
+			if nnMsg.getSeq() > n.state.seq+1 {
 				key := fmt.Sprintf("seq:%d", nnMsg.getSeq()-1)
 				if n.timeout.Exists(key) {
 					return nil
@@ -337,7 +369,7 @@ func (n *Node) intercept(msg interface{}) error {
 				n.syncCounter.Done(key, nnMsg.getFromIdx())
 				if n.syncCounter.Ok(key) {
 					n.timeout.AddAddTimeout(key, time.Second*10)
-					n.syncTo(nnMsg.getSeq() - 1)
+					n.syncLogsTo(nnMsg.getSeq() - 1)
 				}
 			}
 		}
@@ -370,9 +402,9 @@ func (n *Node) onReceive(msg interface{}) (err error) {
 			//fmt.Printf("[%d]commit msg loss, %v", n.idx, m)
 		}
 	case *SyncMsg:
-		if m.tp == 0 {
+		if m.req {
 			fmt.Printf("[%d]receive sync request msg:%s\n", n.idx, msg)
-			n.onRequestSyncMsg(m)
+			n.onRequestSyncLogsMsg(m)
 		} else {
 			fmt.Printf("[%d]receive sync response msg:%s\n", n.idx, msg)
 			n.mBuf.syncBuf.Enqueue(m)
@@ -384,6 +416,9 @@ func (n *Node) onReceive(msg interface{}) (err error) {
 		fmt.Printf("[%d]receive new view msg:%s\n", n.idx, msg)
 		n.mBuf.newViewBuf.Enqueue(m)
 	case *HeartBeatMsg:
+	case *PrimaryDown:
+		fmt.Printf("[%d]receive primary down msg:%s\n", n.idx, msg)
+		n.onPrimaryDown(m)
 
 	}
 	return
@@ -391,8 +426,7 @@ func (n *Node) onReceive(msg interface{}) (err error) {
 func (n *Node) onRequestMsg(m *ReqMsg) error {
 	fmt.Printf("[%d]on request msg:%v\n", n.idx, m)
 	if !n.isPrimary() {
-		n.switchToViewChange(0, n.state.viewId+1)
-		return nil
+		return n.onRequestMsgForBackup(m)
 	}
 
 	if n.cur.cur != 0 {
@@ -417,12 +451,64 @@ func (n *Node) onRequestMsg(m *ReqMsg) error {
 	return nil
 }
 
+func (n *Node) onRequestMsgForBackup(m *ReqMsg) error {
+	fmt.Printf("[%d][backup]on request msg:%v\n", n.idx, m)
+
+	for _, v := range n.state.logs {
+		if v.hash == m.hash {
+			return nil
+		}
+	}
+
+	newMsg := *m
+
+	n.sendTo(newMsg, calcPrimary(n.state.viewId, n.clusterSize))
+
+	key := fmt.Sprintf("%d_%s", n.state.viewId, m.hash)
+
+	if _, ok := n.viewTimeoutCh[key]; ok {
+		return nil
+	}
+	c := make(chan struct{})
+	n.viewTimeoutCh[key] = c
+	go func(k string, closed chan struct{}, viewId int64, seq int64) {
+		select {
+		case <-time.After(3 * time.Second):
+			n.backupRequestTimeout(key, viewId, seq)
+		case <-closed:
+			delete(n.viewTimeoutCh, k)
+			return
+		}
+	}(key, c, n.state.viewId, n.state.seq)
+	return nil
+}
+
+func (n *Node) backupRequestTimeout(key string, viewId int64, seq int64) error {
+	fmt.Printf("[%d]request timeout msg:%s, %d, %d\n", n.idx, key, viewId, seq)
+	if viewId == n.state.viewId && seq == n.state.seq {
+		key := fmt.Sprintf("primaryDown:%d", viewId)
+		n.syncCounter.Done(key, n.idx)
+
+		n.broadcast(&PrimaryDown{
+			nodeMsg: nodeMsg{
+				viewId:  viewId,
+				seq:     n.state.seq,
+				fromIdx: n.idx,
+			},
+		})
+		return nil
+	} else {
+		delete(n.viewTimeoutCh, key)
+		return nil
+	}
+}
+
 func (n *Node) prepareTimeout() error {
 	return n.switchToViewChange(1, n.state.viewId+1)
 }
 
 func (n *Node) viewChangeTimeout(viewId int64) error {
-
+	fmt.Printf("[%d]view change timeout[%d].", n.idx, viewId)
 	return n.switchToViewChange(3, viewId+1)
 }
 
@@ -466,21 +552,24 @@ func (n *Node) switchToPrepare(msg *PPMsg) error {
 // 2. commit
 // 3. self timeout
 func (n *Node) switchToViewChange(tp int32, newViewId int64) error {
-	flag := n.cur.switchCur(tp, 3)
-	if !flag {
-		return errors.Errorf("switch fail.")
+	if tp != 3 {
+		flag := n.cur.switchCur(tp, 3)
+		if !flag {
+			return errors.Errorf("switch fail.")
+		}
+
+		n.cur.reset()
+
+		n.cur.waitingState = &stateCounterImpl{
+			okCnt: 2*n.f + 1,
+
+			done:      make(map[string]map[uint32]struct{}),
+			timeoutCh: make(chan struct{}),
+		}
 	}
 
-	n.cur.reset()
-
-	n.cur.waitingState = &stateCounterImpl{
-		okCnt: 2*n.f + 1,
-
-		done:      make(map[string]map[uint32]struct{}),
-		timeoutCh: make(chan struct{}),
-	}
-
-	n.cur.waitingState.Done("", n.idx)
+	key := fmt.Sprintf("%d", newViewId)
+	n.cur.waitingState.Done(key, n.idx)
 	go func(closed chan struct{}) {
 		select {
 		case <-time.After(10 * time.Second):
@@ -515,14 +604,20 @@ func (n *Node) apply(msg *PPMsg) error {
 	return nil
 }
 
-func (n *Node) newViewApply(msg *NewViewMsg) error {
-	flag := n.cur.switchCur(3, 0)
+func (n *Node) newViewApply(tp int32, msg *NewViewMsg) error {
+	flag := n.cur.switchCur(tp, 0)
 	if !flag {
 		return errors.Errorf("switch fail.")
 	}
 
-	n.cur.waitingState.Destroy()
-	n.cur.reset()
+	for k, v := range n.viewTimeoutCh {
+		delete(n.viewTimeoutCh, k)
+		close(v)
+	}
+	if n.cur.waitingState != nil {
+		n.cur.waitingState.Destroy()
+		n.cur.reset()
+	}
 	n.state.viewId = msg.viewId
 	return nil
 }
@@ -546,18 +641,19 @@ func (n *Node) syncSuccess(msg *SyncMsg) error {
 		logs = append(logs, v)
 	}
 	n.state.logs = logs
+	n.state.viewId = msg.viewId
 	fmt.Printf("sync success, seq:%d.\n", msg.seq)
 	return nil
 }
 
-func (n *Node) syncTo(targetSeq int64) error {
+func (n *Node) syncLogsTo(targetSeq int64) error {
 	msg := &SyncMsg{
 		nodeMsg: nodeMsg{
 			viewId:  n.state.viewId,
 			seq:     targetSeq,
 			fromIdx: n.idx,
 		},
-		tp:   0,
+		req:  true,
 		hash: "",
 		logs: nil,
 	}
@@ -603,6 +699,16 @@ func (n *Node) broadcast(msg interface{}) error {
 	}
 	return nil
 }
+
+func (n *Node) sendTo(msg interface{}, idx uint32) error {
+	err := n.net.SendTo(n.idx, idx, msg)
+	if err != nil {
+		log15.Error(fmt.Sprintf("Send msg error %s - %d", err.Error(), n.idx))
+		return err
+	}
+	return nil
+}
+
 func (n *Node) broadcastToClients(msg interface{}) error {
 	for _, v := range n.clients {
 		err := n.net.SendTo(n.idx, v.idx, msg)
@@ -697,12 +803,16 @@ func (n *Node) onViewChangeMsg(m *ViewChangeMsg) error {
 		return nil
 	}
 
-	if calcPrimary(m.viewId, n.clusterSize) != n.idx {
-		return nil
-	}
+	key := fmt.Sprintf("%d", m.viewId)
+	n.cur.waitingState.Done(key, m.fromIdx)
+	if n.cur.waitingState.Ok(key) {
+		if calcPrimary(m.viewId, n.clusterSize) != n.idx {
+			return nil
+		}
+		if m.viewId <= n.state.viewId {
+			return nil
+		}
 
-	n.cur.waitingState.Done("", m.fromIdx)
-	if n.cur.waitingState.Ok("") {
 		newViewMsg := &NewViewMsg{
 			nodeMsg: nodeMsg{
 				viewId:  m.viewId,
@@ -711,7 +821,7 @@ func (n *Node) onViewChangeMsg(m *ViewChangeMsg) error {
 			},
 		}
 
-		n.newViewApply(newViewMsg)
+		n.newViewApply(3, newViewMsg)
 		n.broadcast(newViewMsg)
 	}
 	return nil
@@ -719,11 +829,10 @@ func (n *Node) onViewChangeMsg(m *ViewChangeMsg) error {
 
 func (n *Node) onNewViewMsg(msg *NewViewMsg) error {
 	fmt.Printf("[%d]on newView msg:%v\n", n.idx, msg)
-
-	if n.cur.cur != 3 {
+	if msg.viewId <= n.state.viewId {
 		return nil
 	}
-	n.newViewApply(msg)
+	n.newViewApply(n.cur.cur, msg)
 	return nil
 }
 
@@ -758,8 +867,8 @@ func (n *Node) onCommitMsg(m *BFTMsg) error {
 	}
 }
 
-func (n *Node) onRequestSyncMsg(m *SyncMsg) error {
-	fmt.Printf("[%d]on sync request msg:%v\n", n.idx, m)
+func (n *Node) onRequestSyncLogsMsg(m *SyncMsg) error {
+	fmt.Printf("[%d]on sync logs request msg:%v\n", n.idx, m)
 	if m.viewId != n.state.viewId {
 		return nil
 	}
@@ -774,7 +883,7 @@ func (n *Node) onRequestSyncMsg(m *SyncMsg) error {
 			seq:     m.seq,
 			fromIdx: n.idx,
 		},
-		tp:   1,
+		req:  false,
 		hash: hash,
 		logs: logs,
 	}
@@ -786,12 +895,12 @@ func (n *Node) onRequestSyncMsg(m *SyncMsg) error {
 	return nil
 }
 
-func (n *Node) onResponseSyncMsg(m *SyncMsg) error {
-	fmt.Printf("[%d]on sync response msg:%v\n", n.idx, m)
+func (n *Node) onResponseSyncLogsMsg(m *SyncMsg) error {
+	fmt.Printf("[%d]on sync logs response msg:%v\n", n.idx, m)
 	if m.seq <= n.state.seq {
 		return nil
 	}
-	key := fmt.Sprintf("sync:%d-%s", m.seq, m.hash)
+	key := fmt.Sprintf("sync:%d-%s-%d", m.seq, m.hash, m.viewId)
 	n.syncCounter.Done(key, m.fromIdx)
 	if n.syncCounter.Ok(key) {
 		n.syncSuccess(m)
@@ -799,10 +908,36 @@ func (n *Node) onResponseSyncMsg(m *SyncMsg) error {
 	return nil
 }
 
+func (n *Node) onPrimaryDown(m *PrimaryDown) error {
+	fmt.Printf("[%d]on primary down msg:%v\n", n.idx, m)
+	if m.viewId != n.state.viewId {
+		return nil
+	}
+
+	if n.cur.cur == 3 {
+		return nil
+	}
+
+	key := fmt.Sprintf("primaryDown:%d", m.viewId)
+	n.syncCounter.Done(key, m.fromIdx)
+	if n.syncCounter.Ok(key) {
+		n.switchToViewChange(n.cur.cur, n.state.viewId+1)
+	}
+	return nil
+}
+
 func (n *Node) waitingSync() error {
 	for n.mBuf.syncBuf.Len() > 0 {
 		m := n.mBuf.syncBuf.Dequeue().(*SyncMsg)
-		n.onResponseSyncMsg(m)
+		n.onResponseSyncLogsMsg(m)
+	}
+	return nil
+}
+
+func (n *Node) waitingNewView() error {
+	for n.mBuf.newViewBuf.Len() > 0 {
+		m := n.mBuf.newViewBuf.Dequeue().(*NewViewMsg)
+		n.onNewViewMsg(m)
 	}
 	return nil
 }
@@ -858,7 +993,9 @@ func (c *Cli) SendRequest(op string) error {
 	node := c.peers[primary]
 
 	errMsg := c.net.SendTo(c.idx, node.idx, msg)
+
 	if errMsg != nil {
+		// broadcast to the others
 		for _, v := range c.peers {
 			if v.idx == node.idx {
 				continue
