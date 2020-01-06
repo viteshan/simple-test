@@ -44,6 +44,7 @@ func TestPbft(t *testing.T) {
 				commitBuf:  queue.New(),
 				replyBuf:   queue.New(),
 				vcBUf:      queue.New(),
+				newViewBuf: queue.New(),
 			},
 			syncCounter: &stateCounterImpl{
 				okCnt:     2*f + 1,
